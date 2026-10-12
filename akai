@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# ============================================================
+#  akai — 把桌面上的 Akai 采样盘镜像自动解出 WAV
+#
+#  用法：
+#    1) 把 iso / img 镜像放到桌面
+#    2) 终端输入：akai
+#    3) 结果在桌面 <镜像名>_wav/
+#
+#  流程：定位镜像 → 判定扇区/封装 → 必要时 2352→2048 → 导出 →
+#        合并残留 L/R → 打印报告
+# ============================================================
+
+set -uo pipefail
+
+C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_RED=$'\033[31m'
+C_GRN=$'\033[32m'; C_YEL=$'\033[33m'; C_CYA=$'\033[36m'
+
+say()  { printf '%s\n' "$*"; }
+head_() { printf '\n%s%s%s\n' "$C_BOLD$C_CYA" "$*" "$C_RESET"; }
+ok()   { printf '%s✓%s %s\n' "$C_GRN" "$C_RESET" "$*"; }
+warn() { printf '%s!%s %s\n' "$C_YEL" "$C_RESET" "$*"; }
+err()  { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# ---------- 桌面路径（兼容 iCloud 同步） ----------
+DESK="$HOME/Desktop"
+DESK_ICLOUD="$HOME/Library/Mobile Documents/com~apple~CloudDocs/Desktop"
+[ -d "$DESK_ICLOUD" ] && [ ! -d "$DESK" ] && DESK="$DESK_ICLOUD"
+
+# ---------- 1. 定位镜像 ----------
+head_ "① 定位镜像"
+ISO=""
+candidates=()
+while IFS= read -r f; do candidates+=("$f"); done < <(
+    for d in "$DESK" "$DESK_ICLOUD"; do
+        [ -d "$d" ] || continue
+        find "$d" -maxdepth 1 -type f \
+             \( -iname '*.iso' -o -iname '*.img' -o -iname '*.cdr' -o -iname '*.bin' \) \
+             ! -name '*-2048.*' 2>/dev/null
+    done | sort -u
+)
+
+if [ ${#candidates[@]} -eq 0 ]; then
+    die "桌面没有找到 iso/img/cdr/bin 镜像，先放一个进来。"
+elif [ ${#candidates[@]} -eq 1 ]; then
+    ISO="${candidates[0]}"
+    ok "找到：$ISO"
+else
+    say "桌面发现 ${#candidates[@]} 个镜像："
+    i=1
+    for f in "${candidates[@]}"; do
+        printf '   %s%d)%s %s\n' "$C_BOLD" "$i" "$C_RESET" "$(basename "$f")"
+        i=$((i + 1))
+    done
+    printf '选择编号（默认 1）：'
+    read -r choice
+    choice="${choice:-1}"
+    case "$choice" in
+        ''|*[!0-9]*) die "无效输入" ;;
+    esac
+    if [ "$choice" -lt 1 ] || [ "$choice" -gt ${#candidates[@]} ]; then die "超出范围"; fi
+    ISO="${candidates[$((choice - 1))]}"
+    ok "选用：$ISO"
+fi
+
+BASE="$(basename "$ISO")"
+NAME="${BASE%.*}"
+OUT="$DESK/${NAME}_wav"
+
+# ---------- 2. 判定扇区/封装 ----------
+head_ "② 判定镜像封装"
+probe=$(python3 - "$ISO" <<'PY'
+import os, sys
+path = sys.argv[1]
+size = os.path.getsize(path)
+with open(path, "rb") as f:
+    buf = f.read(96 * 1024)
+idx = buf.find(b"CD001")
+dstart = idx - 1 if idx >= 0 else -1
+table = [
+    ("iso9660_2048",   2048, 16 * 2048, 0),
+    ("raw_2352_mode1", 2352, 16 * 2352, 16),
+    ("raw_2352_mode2", 2352, 16 * 2352, 24),
+    ("raw_2336",       2336, 16 * 2336, 8),
+    ("raw_2448",       2448, 16 * 2448, 16),
+]
+fmt = sector = off = None
+if dstart >= 0:
+    for name, sec, base, doff in table:
+        if dstart == base + doff and size % sec == 0:
+            fmt, sector, off = name, sec, doff
+            break
+if fmt is None:
+    for sec in (2048, 2352, 2336, 2448):
+        if size % sec == 0:
+            fmt = "akai_native" if dstart < 0 else "iso9660_2048"
+            sector, off = sec, 0
+            break
+if fmt is None:
+    fmt, sector, off = "akai_native", 512, 0
+print("SIZE=%d" % size)
+print("CD001=%d" % idx)
+print("FORMAT=%s" % fmt)
+print("SECTOR=%s" % sector)
+print("OFFSET=%s" % off)
+PY
+) || die "读取镜像失败"
+
+SIZE=$(printf '%s\n' "$probe" | sed -n 's/^SIZE=//p')
+CD001=$(printf '%s\n' "$probe" | sed -n 's/^CD001=//p')
+FORMAT=$(printf '%s\n' "$probe" | sed -n 's/^FORMAT=//p')
+SECTOR=$(printf '%s\n' "$probe" | sed -n 's/^SECTOR=//p')
+OFFSET=$(printf '%s\n' "$probe" | sed -n 's/^OFFSET=//p')
+
+say "大小：$(python3 -c "print(f'{$SIZE:,}')") 字节"
+case "$FORMAT" in
+    akai_native)
+        ok "Akai 原生镜像（无 ISO9660 描述符，${SECTOR} 字节块）→ 无需转换"
+        warn "这类盘 macOS 挂不上、解压软件打不开是正常的"
+        WORK="$ISO"
+        ;;
+    iso9660_2048)
+        ok "标准 ISO9660 / 2048 字节扇区 → 无需转换"
+        WORK="$ISO"
+        ;;
+    raw_2352_mode1|raw_2352_mode2|raw_2336|raw_2448)
+        warn "裸扇区镜像（$FORMAT，${SECTOR} 字节/扇区）→ 需转成 2048"
+        WORK="$DESK/${NAME}-2048.iso"
+        nsec=$(python3 - "$ISO" "$WORK" "$SECTOR" "$OFFSET" <<'PY'
+import sys
+src, dst, sector, off = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+n = 0
+with open(src, "rb") as f, open(dst, "wb") as o:
+    while True:
+        b = f.read(sector)
+        if len(b) < sector:
+            break
+        o.write(b[off:off + 2048])
+        n += 1
+print(n)
+PY
+)
+        ok "已生成 $(basename "$WORK")（转换 $nsec 个扇区）"
+        ;;
+    *)
+        warn "未能判定封装，按原样交给提取工具尝试"
+        WORK="$ISO"
+        ;;
+esac
+
+# ---------- 3. 检查提取工具 ----------
+head_ "③ 检查提取工具"
+HAVE_SMPL=0; HAVE_AKAI=0
+python3 -c "import smpl_extract" >/dev/null 2>&1 && HAVE_SMPL=1
+command -v akaiextract >/dev/null 2>&1 && HAVE_AKAI=1
+
+if [ "$HAVE_SMPL" -eq 0 ] && [ "$HAVE_AKAI" -eq 0 ]; then
+    warn "两个提取工具都没装，正在安装 smpl-extract…"
+    python3 -m pip install --user smpl-extract >/dev/null 2>&1 \
+        && python3 -c "import smpl_extract" >/dev/null 2>&1 && HAVE_SMPL=1
+    if [ "$HAVE_SMPL" -eq 0 ] && command -v brew >/dev/null 2>&1; then
+        warn "改用 Homebrew 安装 libgig（含 akaiextract）…"
+        brew install libgig >/dev/null 2>&1 && HAVE_AKAI=1
+    fi
+fi
+[ "$HAVE_SMPL" -eq 1 ] && ok "smpl-extract 可用（优先，自动合并 L/R + 保留 loop 点）"
+[ "$HAVE_AKAI" -eq 1 ] && ok "akaiextract 可用（备用）"
+[ "$HAVE_SMPL" -eq 0 ] && [ "$HAVE_AKAI" -eq 0 ] && die "没有可用工具：pip install smpl-extract 或 brew install libgig"
+
+# ---------- 4. 导出 ----------
+head_ "④ 导出采样"
+rm -rf "$OUT"; mkdir -p "$OUT"
+[ -f "$WORK" ] || die "待处理镜像不是文件：$WORK"
+
+METHOD=""
+LOG=$(mktemp); trap 'rm -f "$LOG"' EXIT
+wavcount() { find "$OUT" -iname '*.wav' 2>/dev/null | wc -l | tr -d ' '; }
+
+if [ "$HAVE_SMPL" -eq 1 ]; then
+    say "── 结构概览 ──"
+    python3 -m smpl_extract ls "$WORK" >"$LOG" 2>&1
+    sed 's/^/   /' "$LOG"
+
+    # 注意：smpl_extract 的外层解析器会把 -d 当未知选项重排参数，
+    # 某些组合下目标目录会被误当成镜像文件（OSError: is not a file）。
+    # 因此优先用「cd 进目标目录 + 默认输出」这种不含 -d 的写法。
+    say "── 开始导出 ──"
+    for attempt in 1 2 3; do
+        rc=0
+        case $attempt in
+            1) say "  尝试 1：cd 到目标目录 + 默认输出"
+               ( cd "$OUT" && python3 -m smpl_extract export "$WORK" ) >"$LOG" 2>&1 || rc=$? ;;
+            2) say "  尝试 2：镜像在前、-d 在后"
+               python3 -m smpl_extract export "$WORK" -d "$OUT" >"$LOG" 2>&1 || rc=$? ;;
+            3) say "  尝试 3：-d 在前、镜像在后"
+               python3 -m smpl_extract export -d "$OUT" "$WORK" >"$LOG" 2>&1 || rc=$? ;;
+        esac
+        if [ "$rc" -eq 0 ]; then
+            [ "$(wavcount)" -gt 0 ] && METHOD="smpl_extract" && ok "导出成功" && break
+            warn "退出码为 0 但没有产出 WAV，换下一种写法"
+        else
+            sed 's/^/   /' "$LOG" \
+              | grep -iE 'error|Traceback|is not a file|Could not find|not a directory' \
+              | head -3 | sed 's/^/     /'
+        fi
+    done
+fi
+if [ -z "$METHOD" ] && [ "$HAVE_AKAI" -eq 1 ]; then
+    warn "smpl-extract 未成功，改用 akaiextract（不合并 L/R，稍后自动处理）"
+    rm -rf "$OUT"; mkdir -p "$OUT"
+    if akaiextract "$WORK" "$OUT" >"$LOG" 2>&1; then
+        sed 's/^/   /' "$LOG" | tail -5
+        [ "$(wavcount)" -gt 0 ] && METHOD="akaiextract"
+    else
+        sed 's/^/   /' "$LOG" | tail -5
+    fi
+fi
+[ -z "$METHOD" ] && die "导出失败"
+
+count=$(find "$OUT" -iname '*.wav' 2>/dev/null | wc -l | tr -d ' ')
+[ "$count" -eq 0 ] && die "导出了 0 个 WAV：可能是混合模式盘，内容在 CD 音轨里（需用 XLD/EAC 抓轨）"
+ok "$METHOD 导出 $count 个 WAV"
+
+# ---------- 5. 合并残留 L/R ----------
+head_ "⑤ 检查 / 合并左右声道"
+merge_out=$(python3 - "$OUT" <<'PY'
+import os, re, wave, array, collections, sys
+src = sys.argv[1]
+dst = src + "_stereo"
+allf = [os.path.relpath(os.path.join(dp, f), src)
+        for dp, _, fs in os.walk(src) for f in fs if f.lower().endswith(".wav")]
+pat = re.compile(r"^(.*?)[-_]([LR])\.wav$", re.I)
+pairs = collections.defaultdict(dict); other = []
+for rel in allf:
+    d, b = os.path.split(rel)
+    m = pat.match(b)
+    if m:
+        pairs[(d, m.group(1))][m.group(2).upper()] = rel
+    else:
+        other.append(rel)
+todo = [(k, v) for k, v in pairs.items() if "L" in v and "R" in v]
+print("PAIRS_TODO=%d" % len(todo))
+print("HALF=%d" % sum(1 for v in pairs.values() if len(v) == 1))
+if not todo:
+    sys.exit(0)
+os.makedirs(dst, exist_ok=True)
+done = 0
+for (d, base), ch in todo:
+    lw = wave.open(os.path.join(src, ch["L"])); rw = wave.open(os.path.join(src, ch["R"]))
+    if lw.getnframes() != rw.getnframes():
+        lw.close(); rw.close(); continue
+    od = os.path.join(dst, d)
+    if od: os.makedirs(od, exist_ok=True)
+    out = wave.open(os.path.join(od, base + ".wav"), "w")
+    out.setnchannels(2); out.setsampwidth(lw.getsampwidth()); out.setframerate(lw.getframerate())
+    la = array.array('h'); la.frombytes(lw.readframes(lw.getnframes()))
+    ra = array.array('h'); ra.frombytes(rw.readframes(rw.getnframes()))
+    it = array.array('h')
+    for i in range(len(la)):
+        it.append(la[i]); it.append(ra[i])
+    out.writeframes(it.tobytes()); out.close()
+    lw.close(); rw.close(); done += 1
+for rel in other:
+    o = os.path.join(dst, rel); os.makedirs(os.path.dirname(o), exist_ok=True)
+    open(o, "wb").write(open(os.path.join(src, rel), "rb").read())
+print("MERGED=%d" % done)
+PY
+) || true
+
+TODO=$(printf '%s\n' "$merge_out" | sed -n 's/^PAIRS_TODO=//p')
+HALF=$(printf '%s\n' "$merge_out" | sed -n 's/^HALF=//p')
+MERGED=$(printf '%s\n' "$merge_out" | sed -n 's/^MERGED=//p')
+FINAL="$OUT"
+
+if [ "${TODO:-0}" -eq 0 ]; then
+    ok "没有待合并的 L/R 对 —— 声道已是正确的"
+    [ "${HALF:-0}" -gt 0 ] && warn "有 $HALF 个单边文件（只有 -L 或只有 -R），未处理"
+else
+    ok "合并 ${MERGED:-0} 对 L/R → ${NAME}_wav_stereo/"
+    FINAL="${OUT}_stereo"
+fi
+
+# ---------- 6. 报告 ----------
+head_ "⑥ 完成"
+python3 - "$FINAL" "$SIZE" "$FORMAT" "$METHOD" <<'PY'
+import os, sys, wave, collections
+root, size, fmt, method = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+total = 0; chans = collections.Counter(); bytes_ = 0; dirs = set()
+for dp, _, fs in os.walk(root):
+    for f in fs:
+        if not f.lower().endswith(".wav"):
+            continue
+        p = os.path.join(dp, f)
+        total += 1; bytes_ += os.path.getsize(p)
+        dirs.add(os.path.relpath(dp, root).split(os.sep)[0])
+        try:
+            w = wave.open(p); chans[w.getnchannels()] += 1; w.close()
+        except Exception:
+            chans[0] += 1
+mb = lambda b: "%.0f MB" % (b / 1048576) if b >= 1048576 else "%.0f KB" % (b / 1024)
+print("  镜像       : %s（%s）" % (fmt, mb(size)))
+print("  提取工具   : %s" % method)
+print("  输出目录   : %s" % root)
+print("  WAV 总数   : %d" % total)
+for c in sorted(chans):
+    label = {1: "单声道", 2: "立体声"}.get(c, "未知")
+    print("    %-6s : %d 个" % (label, chans[c]))
+print("  占用空间   : %s" % mb(bytes_))
+print("  顶层分组   : %s" % ", ".join(sorted(dirs)))
+PY
+say ""
+ok "直接把输出文件夹拖进 DAW 即可"
+warn "loop 点需在 DAW 里重新设置（WAV 不带 Akai 的 loop 标记）"
